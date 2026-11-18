@@ -1,0 +1,119 @@
+#include <Wire.h>
+#include <driver/i2s.h>
+#include <Adafruit_ADS1X15.h>
+#include <DFRobot_BloodOxygen_S.h> // Updated for the DFRobot algorithm module
+#include <math.h> 
+
+// --- Hardware Pin Definitions ---
+#define I2S_WS 15        
+#define I2S_SD 32        
+#define I2S_SCK 14       
+
+Adafruit_ADS1115 ads; 
+DFRobot_BloodOxygen_S_I2C particleSensor(&Wire, 0x57); // Set to default 0x57 address
+
+TaskHandle_t SensorTask;
+TaskHandle_t AudioTask;
+
+volatile double latest_audio_rms = 0.0;
+
+void configureI2S() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+  };
+  
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(); 
+
+  // 1. Initialize ADS1115 (Piezo)
+  if (!ads.begin()) {
+    Serial.println("ADS1115 initialization failed! Check wiring.");
+    while (1);
+  }
+  ads.setGain(GAIN_SIXTEEN); 
+
+  // 2. Initialize DFRobot MAX30102 (SpO2)
+  if (false == particleSensor.begin()) {
+    Serial.println("MAX30102 initialization failed! Check wiring & I2C switch.");
+    while (1);
+  }
+  particleSensor.sensorStartCollect(); // Boot up the sensor's internal algorithm
+
+  // 3. Initialize I2S Audio
+  configureI2S();
+
+  // Note: Output format changed because the DFRobot module calculates SpO2 and Heart Rate automatically!
+  Serial.println("System Ready! Output format: Timestamp, Piezo, SpO2_Percent, HeartRate_BPM, Audio_RMS");
+
+  // 4. Launch FreeRTOS Tasks
+  xTaskCreatePinnedToCore(AudioTaskCode, "AudioTask", 10000, NULL, 1, &AudioTask, 0);
+  xTaskCreatePinnedToCore(SensorTaskCode, "SensorTask", 10000, NULL, 1, &SensorTask, 1);
+}
+
+void loop() {
+  vTaskDelay(portMAX_DELAY);
+}
+
+// --- TASK 1: I2C Sensors & Serial Logging (Core 1) ---
+void SensorTaskCode(void * pvParameters) {
+  for(;;) {
+    uint32_t timestamp = millis();
+    int16_t piezo_adc = ads.readADC_SingleEnded(0); 
+    
+    // Read the calculated algorithm data directly from the DFRobot module
+    particleSensor.getHeartbeatSPO2();
+    int spo2_percent = particleSensor._sHeartbeatSPO2.SPO2;
+    int heart_rate = particleSensor._sHeartbeatSPO2.Heartbeat;
+    
+    double current_audio = latest_audio_rms; 
+
+    // Print to Serial
+    Serial.printf("%lu,%d,%d,%d,%.6f\n", timestamp, piezo_adc, spo2_percent, heart_rate, current_audio);
+    
+    vTaskDelay(20 / portTICK_PERIOD_MS); 
+  }
+}
+
+// --- TASK 2: I2S Audio Processing (Core 0) ---
+void AudioTaskCode(void * pvParameters) {
+  size_t bytes_read;
+  int32_t i2s_read_buff[64];
+
+  for(;;) {
+    i2s_read(I2S_NUM_0, &i2s_read_buff, sizeof(i2s_read_buff), &bytes_read, portMAX_DELAY);
+    
+    double sum_squares = 0;
+    int samples = bytes_read / 4; 
+    
+    for (int i = 0; i < samples; i++) {
+      double normalized = (double)i2s_read_buff[i] / 2147483648.0; 
+      sum_squares += (normalized * normalized);
+    }
+    
+    if (samples > 0) {
+      latest_audio_rms = sqrt(sum_squares / samples); 
+    }
+    
+    vTaskDelay(1); 
+  }
+}

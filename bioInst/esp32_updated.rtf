@@ -1,0 +1,171 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #include <Wire.h>\
+#include <driver/i2s.h>\
+#include <Adafruit_ADS1X15.h>\
+#include <DFRobot_BloodOxygen_S.h>\
+#include <Adafruit_Sensor.h>\
+#include <Adafruit_ADXL343.h>\
+#include <math.h>\
+#include <WiFi.h>\
+#include <WiFiUdp.h>\
+\
+// --- NETWORK CONFIGURATION ---\
+const char* ssid = "YOUR_WIFI_NETWORK_NAME";\
+const char* password = "YOUR_WIFI_PASSWORD";\
+const char* hostPC_IP = "192.168.1.XXX"; // REPLACE WITH YOUR MAC'S IP ADDRESS\
+const int udpPort = 5000;\
+\
+WiFiUDP udp;\
+\
+// --- HARDWARE PIN DEFINITIONS ---\
+#define I2S_WS 15\
+#define I2S_SD 32\
+#define I2S_SCK 14\
+\
+Adafruit_ADS1115 ads;\
+DFRobot_BloodOxygen_S_I2C particleSensor(&Wire, 0x57);\
+Adafruit_ADXL343 accel = Adafruit_ADXL343(12345);\
+\
+TaskHandle_t SensorTask;\
+TaskHandle_t AudioTask;\
+\
+volatile double latest_audio_rms = 0.0;\
+\
+void configureI2S() \{\
+  i2s_config_t i2s_config = \{\
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),\
+    .sample_rate = 16000,\
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,\
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,\
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,\
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,\
+    .dma_buf_count = 8,\
+    .dma_buf_len = 64,\
+    .use_apll = false\
+  \};\
+\
+  i2s_pin_config_t pin_config = \{\
+    .bck_io_num = I2S_SCK,\
+    .ws_io_num = I2S_WS,\
+    .data_out_num = I2S_PIN_NO_CHANGE,\
+    .data_in_num = I2S_SD\
+  \};\
+\
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);\
+  i2s_set_pin(I2S_NUM_0, &pin_config);\
+\}\
+\
+void setup() \{\
+  Serial.begin(115200);\
+  Wire.begin();\
+\
+  // 1. Initialize Wi-Fi\
+  Serial.print("Connecting to Wi-Fi");\
+  WiFi.begin(ssid, password);\
+  while (WiFi.status() != WL_CONNECTED) \{\
+    delay(500);\
+    Serial.print(".");\
+  \}\
+  Serial.println("\\nWi-Fi Connected! IP: " + WiFi.localIP().toString());\
+\
+  // 2. Initialize ADS1115 (Piezo)\
+  if (!ads.begin()) \{\
+    Serial.println("ADS1115 initialization failed! Check wiring.");\
+    while (1);\
+  \}\
+  ads.setGain(GAIN_SIXTEEN);\
+\
+  // 3. Initialize DFRobot MAX30102 (SpO2)\
+  if (false == particleSensor.begin()) \{\
+    Serial.println("MAX30102 initialization failed! Check wiring & I2C switch.");\
+    while (1);\
+  \}\
+  particleSensor.sensorStartCollect();\
+\
+  // 4. Initialize ADXL343 (Accelerometer)\
+  if (!accel.begin()) \{\
+    Serial.println("ADXL343 initialization failed! Check I2C wiring.");\
+    while (1);\
+  \}\
+  accel.setRange(ADXL343_RANGE_2_G); // High sensitivity for sleep posture & motion\
+\
+  // 5. Initialize I2S Audio\
+  configureI2S();\
+\
+  Serial.println("System Ready! Streaming 8-channel data over UDP...");\
+\
+  // 6. Launch FreeRTOS Tasks\
+  xTaskCreatePinnedToCore(AudioTaskCode, "AudioTask", 10000, NULL, 1, &AudioTask, 0);\
+  xTaskCreatePinnedToCore(SensorTaskCode, "SensorTask", 10000, NULL, 1, &SensorTask, 1);\
+\}\
+\
+void loop() \{\
+  vTaskDelay(portMAX_DELAY);\
+\}\
+\
+// --- TASK 1: I2C Sensors & Wireless Transmission (Core 1) ---\
+void SensorTaskCode(void * pvParameters) \{\
+  sensors_event_t accel_event;\
+\
+  for (;;) \{\
+    uint32_t timestamp = millis();\
+    int16_t piezo_adc = ads.readADC_SingleEnded(0);\
+\
+    particleSensor.getHeartbeatSPO2();\
+    int spo2_percent = particleSensor._sHeartbeatSPO2.SPO2;\
+    int heart_rate = particleSensor._sHeartbeatSPO2.Heartbeat;\
+\
+    accel.getEvent(&accel_event);\
+    float acc_x = accel_event.acceleration.x;\
+    float acc_y = accel_event.acceleration.y;\
+    float acc_z = accel_event.acceleration.z;\
+\
+    double current_audio = latest_audio_rms;\
+\
+    // Format the 8-column CSV payload\
+    char dataPacket[128];\
+    sprintf(\
+      dataPacket,\
+      "%lu,%d,%d,%d,%.6f,%.2f,%.2f,%.2f",\
+      timestamp, piezo_adc, spo2_percent, heart_rate, current_audio, acc_x, acc_y, acc_z\
+    );\
+\
+    // Transmit over UDP\
+    udp.beginPacket(hostPC_IP, udpPort);\
+    udp.print(dataPacket);\
+    udp.endPacket();\
+\
+    // Maintain 50Hz sampling rate\
+    vTaskDelay(20 / portTICK_PERIOD_MS);\
+  \}\
+\}\
+\
+// --- TASK 2: I2S Audio Processing (Core 0) ---\
+void AudioTaskCode(void * pvParameters) \{\
+  size_t bytes_read;\
+  int32_t i2s_read_buff[64];\
+\
+  for (;;) \{\
+    i2s_read(I2S_NUM_0, &i2s_read_buff, sizeof(i2s_read_buff), &bytes_read, portMAX_DELAY);\
+\
+    double sum_squares = 0;\
+    int samples = bytes_read / 4;\
+\
+    for (int i = 0; i < samples; i++) \{\
+      double normalized = (double)i2s_read_buff[i] / 2147483648.0;\
+      sum_squares += (normalized * normalized);\
+    \}\
+\
+    if (samples > 0) \{\
+      latest_audio_rms = sqrt(sum_squares / samples);\
+    \}\
+\
+    vTaskDelay(1);\
+  \}\
+\}}
